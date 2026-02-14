@@ -23,7 +23,7 @@ import (
 	"schedule-management-api/internal/middleware"
 )
 
-// Bridge translates gRPC-Web (browser HTTP/1.1) → native gRPC via TCP.
+// Bridge translates gRPC-Web (browser HTTP/1.1) -> native gRPC via TCP.
 type Bridge struct {
 	conn   *grpc.ClientConn
 	direct *handler.Handler
@@ -45,7 +45,7 @@ func New(addr string, directHandler *handler.Handler, secret string) (*Bridge, e
 
 func (b *Bridge) Close() { b.conn.Close() }
 
-// Handler returns an http.Handler that translates gRPC-Web → gRPC.
+// Handler returns an http.Handler that translates gRPC-Web -> gRPC.
 func (b *Bridge) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
@@ -74,7 +74,7 @@ func (b *Bridge) Handler() http.Handler {
 			return
 		}
 
-		log.Printf("grpc-web → %s", r.URL.Path)
+		log.Printf("grpc-web -> %s", r.URL.Path)
 		b.forward(w, r)
 	})
 }
