@@ -1,137 +1,121 @@
-# decisions
+# Design Decisions
 
-## grpc + grpc-web
+## Why gRPC + gRPC-Web
 
-grpc between frontend and backend. browsers cant do native grpc so theres a grpc-web wrapper baked into the go binary on :8080. considered envoy but didnt want another container for what amounts to format translation. also looked at connect-go but stuck with grpc since thats what was asked.
+Using gRPC between frontend and backend. Browsers can't do native gRPC so there's a grpc-web wrapper baked into the Go binary on :8080. Considered Envoy but didn't want another container for what amounts to format translation.
 
-tradeoff: embedding the proxy means less operational complexity but couples the web layer to the grpc server. fine for this scale.
+Tradeoff: embedding the proxy means less operational complexity but couples the web layer to the grpc server. Fine for this scale.
 
-## data persistence (postgres)
+## Why Postgres
 
-need `EXCLUDE USING gist` on tstzrange for overlap prevention at the db level. also need `SELECT FOR UPDATE` for row locking. sqlite cant do either. mysql doesnt have range exclusion constraints.
+I needed to implement `EXCLUDE USING gist` on tstzrange for overlap prevention at the DB level. Also need `SELECT FOR UPDATE` for row locking. SQLite can't do either. MySQL doesn't have range exclusion constraints.
 
-postgres is overkill for a toy app but the right call for scheduling because:
 - tstzrange handles timezone-aware time math correctly
 - exclusion constraints make double booking structurally impossible
 - connection pooling scales well horizontally
 
-tradeoff: heavier setup vs correctness guarantees. worth it.
+Tradeoff: heavier setup vs correctness guarantees.
 
-## what counts as a conflict
+## What Counts as a Conflict
 
-stakeholders didnt define this so i made assumptions:
+Requirements didn't define this so I made assumptions:
+- Same user, overlapping time range = conflict
+- Adjacent slots fine (10-11 then 11-12), end is exclusive `[)`
+- Different users same time = fine, no shared resource model
+- Updating an appointment checks overlaps too, excluding itself
 
-- same user, overlapping time range = conflict
-- adjacent slots fine (10-11 then 11-12), end is exclusive `[)`
-- different users same time = fine, no shared resource model
-- updating an appointment checks overlaps too, excluding itself
+If there were rooms or equipment I would've added a resource table and extended the exclusion constraint.
 
-if there were rooms or equipment id add a resource table and extend the exclusion constraint. requirements dont mention shared resources so i left it out.
+**Question I would've asked**: do conflicts apply per-user or globally? Are there shared resources like rooms?
 
-**question i would have asked**: do conflicts apply per-user or globally? are there shared resources like rooms? does "conflict" include buffer time between appointments?
+## Handling Concurrent Access
 
-i proceeded assuming per-user since the requirements say "users schedule appointments" not "users book resources."
+Two layers:
+1. App-level overlap check before insert
+2. DB exclusion constraint catches races
 
-## concurrent access
+Tested this: 10 goroutines hit the same slot simultaneously. Exactly 1 wins, 9 get `AlreadyExists`. Postgres does the heavy lifting.
 
-two layers:
+Tradeoff: strict consistency over UX. I'd rather reject a valid request than allow a double booking.
 
-1. app-level overlap check before insert
-2. db exclusion constraint catches races
+## Auth
 
-tested this: 10 goroutines hit the same slot simultaneously. exactly 1 wins, 9 get `AlreadyExists`. postgres does the heavy lifting.
+HTTPOnly cookies. Access token 15min, refresh token 7 days. Refresh rotation — old token revoked on each refresh, reuse of revoked token nukes all tokens for that user (theft detection).
 
-tradeoff: strict consistency over user experience. id rather reject a valid request than allow a double booking. for a scheduling system this is the right call — the cost of a conflict is higher than the cost of a retry.
+REST endpoints for auth (`/auth/login`, `/auth/register`, `/auth/refresh`, `/auth/logout`). grpc-web uses `withCredentials` for cookie passthrough.
 
-## auth
+Bcrypt passwords, HS256 with explicit alg check, same error for wrong email/password (no user enumeration), ownership returns 404 not 403.
 
-httponly cookies. access token 15min, refresh token 7 days. refresh rotation — old token revoked on each refresh, reuse of revoked token nukes all tokens for that user (theft detection). no jwt in localStorage.
+Rate limiting: IP-based token bucket on login/register. 5 req/s burst 10.
 
-rest endpoints for auth (`/auth/login`, `/auth/register`, `/auth/refresh`, `/auth/logout`). grpc-web uses `withCredentials` for cookie passthrough.
+## No ORM
 
-bcrypt passwords, HS256 with explicit alg check, same error for wrong email/password (no user enumeration), ownership returns 404 not 403.
+Raw SQL + pgx. 6 tables worth of queries, an ORM adds indirection for no benefit at this size.
 
-not required by the spec but a multi-user scheduling system without auth is a toy.
-
-## rate limiting
-
-ip-based token bucket on login/register. 5 req/s burst 10. middleware level, runs before auth check.
-
-## no orm
-
-raw sql + pgx. 6 tables worth of queries, an orm adds indirection for no benefit at this size.
-
-## layout
-
-handler/ not controller/, store/ not repository/, no services layer. business logic lives in handlers because theyre all under 50 lines. id extract a service layer if they grew.
 
 ---
 
-## open-ended: recurring appointments
+## Open-Ended Questions
 
-didnt implement but heres how id approach it:
+### Recurring Appointments
 
-add a `recurrence_rule` column to appointments using iCalendar RRULE format (RFC 5545). same standard google calendar uses. store only the rule, expand occurrences on read with a time window.
+I didn't implement this but here's how i would've approached it:
 
-schema change:
+Add `recurrence_rule` column using iCalendar RULE format (RFC 5545). Same standard Google Calendar uses. Store only the rule, expand occurrences on read with a time window.
+
 ```sql
-ALTER TABLE appointments ADD COLUMN rrule TEXT; -- eg "FREQ=WEEKLY;BYDAY=MO,WE,FR"
+ALTER TABLE appointments ADD COLUMN rule TEXT;
 ALTER TABLE appointments ADD COLUMN recurring_until TIMESTAMPTZ;
 ```
 
-the tricky part is conflict detection — youd need to expand the recurrence before checking overlaps. for the exclusion constraint youd either:
-- materialize all occurrences as rows (simple but storage heavy)
-- check conflicts in application code against expanded ranges (flexible but slower)
+The tricky part is conflict detection — you would need to expand the recurrence before checking overlaps. For the exclusion constraint you would either:
+- Materialize all occurrences as rows (simple but storage heavy)
+- Check conflicts in application code against expanded ranges (flexible but slower)
 
-id go with materialization for the first version. simpler to reason about.
+I would go with materialization for the first version.
 
-## open-ended: scalability
+### Scalability
 
-current setup: one go binary + postgres. stateless server so horizontal scaling is straightforward.
+Current setup: one Go binary + Postgres. Stateless server so horizontal scaling is straightforward.
 
-what changes:
-- **pgbouncer** in front of postgres for connection pooling
+What changes:
+- **pgbouncer** in front of Postgres for connection pooling
 - **read replicas** for list queries (appointments are read-heavy)
 - **redis** for session/token caching and hot appointment lists
 - rate limiter state moves to redis (currently in-memory per instance)
-- migration from `EXCLUDE USING gist` to distributed locking if postgres becomes the bottleneck (unlikely until very high write volume)
 
-what doesnt change: the grpc contract, handler logic, auth flow. the server is already stateless so load balancing just works.
+What doesn't change: the grpc contract, handler logic, auth flow. The server is already stateless so load balancing just works.
 
-## open-ended: real-time updates
+### Real-Time Updates
 
-right now the client refetches after mutations. for real-time:
-
-- **server-sent events** on the http server (already running on :8080). cheaper than websockets for one-directional updates.
+Right now the client refetches after mutations. For real-time:
+- **server-sent events** on the HTTP server (already running on :8080). Cheaper than websockets for one-directional updates.
 - or grpc server streaming for appointment change notifications
-- frontend subscribes on mount, receives events when appointments in your range change
 
-id start with SSE because its simpler and the update pattern is "server pushes, client receives" — no bidirectional needed.
+I would start with SSE because it's simpler and the update pattern is "server pushes, client receives" — no bidirectional needed.
 
 ---
 
-## assumptions
+## Assumptions
 
-1. conflicts are per-user not global (no shared resources)
-2. auth is needed even though spec doesnt require it
-3. soft delete is better than hard delete for appointments
-4. appointment times are timezone-aware (TIMESTAMPTZ)
-5. attendees field exists but invitations arent implemented yet
+1. Conflicts are per-user not global (no shared resources)
+2. Auth is needed even though spec doesn't require it
+3. Soft delete is better than hard delete for appointments
+4. Appointment times are timezone-aware (TIMESTAMPTZ)
+5. Attendees field exists but invitations aren't implemented yet
 
-## what id do differently with more time
+## What I'd Do Differently with More Time
 
-1. recurring appointments (rrule based, described above)
-2. attendee invitations with email notifications
-3. structured logging + tracing (right now its just log.Printf)
-4. proper integration tests with docker-compose postgres
-5. calendar view on frontend instead of list view
+1. Recurring appointments (rule based)
+2. Attendee invitations with email notifications
+3. Structured logging + tracing (right now it's just log.Printf)
+4. Integration tests with docker-compose Postgres
+5. Calendar view on frontend instead of list view
 
-## stakeholder questions i would have asked
+## Questions I Would've Asked
 
-1. **conflict scope** — per-user or per-resource? are there shared rooms/equipment?
-2. **conflict buffer** — should there be padding between appointments (eg 15min)?
-3. **recurring appointments** — how complex? daily/weekly only or full rrule support?
-4. **multi-timezone** — do users span timezones? display in local or appointment tz?
-5. **appointment lifecycle** — can users edit past appointments? whats the cancellation policy?
-
-proceeded by assuming the simplest reasonable interpretation for each.
+1. **Conflict scope** — per-user or per-resource? Are there shared rooms/equipment?
+2. **Buffer time** — should there be padding between appointments (eg 15min)?
+3. **Recurring appointments** — how complex? Daily/weekly only or full rule support?
+4. **Multi-timezone** — do users span timezones? Display in local or appointment tz?
+5. **Appointment lifecycle** — can users edit past appointments? What's the cancellation policy?
